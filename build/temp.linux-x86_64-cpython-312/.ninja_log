@@ -30,3 +30,10 @@
 17	35164	1780386159628073441	/workspace/lw-kernel-cuda/build/temp.linux-x86_64-cpython-312/workspace/lw-kernel-cuda/lw_kernel_cuda/csrc/cuda/rmsnorm.o	e17d6bf58919ed77
 17	35210	1780386159675074795	/workspace/lw-kernel-cuda/build/temp.linux-x86_64-cpython-312/workspace/lw-kernel-cuda/lw_kernel_cuda/csrc/cuda/transpose.o	4788b85e1e4fd8e4
 16	34839	1780386421834638554	/workspace/lw-kernel-cuda/build/temp.linux-x86_64-cpython-312/workspace/lw-kernel-cuda/lw_kernel_cuda/csrc/cuda/flash_attention.o	12b51a0890de254d
+17	35521	1780387585950196146	/workspace/lw-kernel-cuda/build/temp.linux-x86_64-cpython-312/workspace/lw-kernel-cuda/lw_kernel_cuda/csrc/cuda/flash_attention.o	12b51a0890de254d
+17	35848	1780387586277205563	/workspace/lw-kernel-cuda/build/temp.linux-x86_64-cpython-312/workspace/lw-kernel-cuda/lw_kernel_cuda/csrc/cuda/prefix_sum.o	f3d5d7f7d6f92bb1
+17	36495	1780387586924224196	/workspace/lw-kernel-cuda/build/temp.linux-x86_64-cpython-312/workspace/lw-kernel-cuda/lw_kernel_cuda/csrc/cuda/conv2d.o	9e73ea03be529b85
+17	38739	1780387589167288793	/workspace/lw-kernel-cuda/build/temp.linux-x86_64-cpython-312/workspace/lw-kernel-cuda/lw_kernel_cuda/csrc/cuda/matmul.o	e3cb5522909dfc3a
+15	35444	1780387732161409786	/workspace/lw-kernel-cuda/build/temp.linux-x86_64-cpython-312/workspace/lw-kernel-cuda/lw_kernel_cuda/csrc/cuda/flash_attention.o	12b51a0890de254d
+15	36468	1780387733186439305	/workspace/lw-kernel-cuda/build/temp.linux-x86_64-cpython-312/workspace/lw-kernel-cuda/lw_kernel_cuda/csrc/cuda/matmul.o	e3cb5522909dfc3a
+15	36705	1780387733423446130	/workspace/lw-kernel-cuda/build/temp.linux-x86_64-cpython-312/workspace/lw-kernel-cuda/lw_kernel_cuda/csrc/cuda/conv2d.o	9e73ea03be529b85
