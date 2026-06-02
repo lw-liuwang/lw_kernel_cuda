@@ -36,7 +36,6 @@ __global__ void scan_blocks_kernel(const float* __restrict__ in,
   __syncthreads();
 
   // ----- Brent-Kung up-sweep (reduction tree) -----
-  // Each step doubles the stride; only elements at stride-1, 2*stride-1, etc. participate
   #pragma unroll
   for (int d = 0; d < 8; d++) {  // log2(256) = 8
     int step = 2 << d;           // 2, 4, 8, 16, 32, 64, 128, 256
@@ -54,74 +53,6 @@ __global__ void scan_blocks_kernel(const float* __restrict__ in,
 
   // ----- Brent-Kung down-sweep (build exclusive scan from partial sums) -----
   if (tid == 0) {
-    shared[blockDim.x - 1] = 0.0f;  // reset last element to 0 (exclusive base)
-  }
-  __syncthreads();
-
-  #pragma unroll
-  for (int d = 7; d >= 0; d--) {
-    int step = 2 << d;
-    int half = step >> 1;
-    if ((tid & (step - 1)) == (step - 1)) {
-      float t = shared[tid - half];
-      shared[tid - half] = shared[tid];
-      shared[tid] += t;
-    }
-    __syncthreads();
-  }
-
-  // Convert exclusive scan to inclusive: result[tid] = exclusive[tid] + original[tid]
-  // We saved original[tid]... but shared[tid] was overwritten by the scan!
-  // Need to re-read original from global memory (aliased by n checks).
-  // Actually, we need the original value. Approach: load into register before scan.
-  // But we already overwrote shared... Instead, just do inclusive scan differently.
-  //
-  // Actually, the down-sweep produces exclusive scan = sum of elements BEFORE tid.
-  // To get inclusive: shared[tid] = exclusive + original = shared[tid] + in[global_idx]
-  // But only if global_idx < n.
-  //
-  // Simple correction: we stored original in shared[0..blockDim.x-1] before scan.
-  // After Brent-Kung down-sweep, shared[tid] = exclusive scan.
-  // To convert to inclusive scan: shared[tid] += original_value.
-  // We can reload original from global mem: in[global_idx] (still valid, global read-only).
-  if (global_idx < n) {
-    // shared[tid] is currently exclusive scan (sum of elements BEFORE this element)
-    // Add the element itself to get inclusive scan
-    shared[tid] += in[global_idx];
-  }
-  __syncthreads();
-
-  // Write output
-  if (global_idx < n) {
-    out[global_idx] = shared[tid];
-  }
-}
-
-/**
- * Single-block exclusive scan of block_sums array.
- * After this, block_sums[i] = sum of original block_sums[0..i-1] (exclusive prefix).
- * Used to compute per-block offsets for multi-block chaining.
- */
-__global__ void scan_block_sums_kernel(float* block_sums, int grid_size) {
-  extern __shared__ float shared[];
-  int tid = threadIdx.x;
-
-  shared[tid] = (tid < grid_size) ? block_sums[tid] : 0.0f;
-  __syncthreads();
-
-  // Brent-Kung up-sweep
-  #pragma unroll
-  for (int d = 0; d < 8; d++) {
-    int step = 2 << d;
-    int half = step >> 1;
-    if ((tid & (step - 1)) == (step - 1)) {
-      shared[tid] += shared[tid - half];
-    }
-    __syncthreads();
-  }
-
-  // Brent-Kung down-sweep (produces exclusive scan)
-  if (tid == 0) {
     shared[blockDim.x - 1] = 0.0f;
   }
   __syncthreads();
@@ -138,9 +69,82 @@ __global__ void scan_block_sums_kernel(float* block_sums, int grid_size) {
     __syncthreads();
   }
 
-  // Write back exclusive prefix sums
-  if (tid < grid_size) {
-    block_sums[tid] = shared[tid];
+  // Convert exclusive scan to inclusive: add the original value
+  if (global_idx < n) {
+    shared[tid] += in[global_idx];
+  }
+  __syncthreads();
+
+  // Write output
+  if (global_idx < n) {
+    out[global_idx] = shared[tid];
+  }
+}
+
+/**
+ * Single-block exclusive scan of block_sums array.
+ * Uses grid-stride loop to handle arbitrary grid_size (not limited to blockDim.x).
+ *
+ * After this, block_sums[i] = sum of original block_sums[0..i-1] (exclusive prefix).
+ * Used to compute per-block offsets for multi-block chaining.
+ *
+ * For large grid_size (> blockDim.x), processes the array in chunks of blockDim.x
+ * and carries the cumulative sum across chunks.
+ */
+__global__ void scan_block_sums_kernel(float* block_sums, int grid_size) {
+  extern __shared__ float shared[];
+  int tid = threadIdx.x;
+  int blockDim_x = blockDim.x;
+
+  float carry = 0.0f;
+
+  for (int chunk = 0; chunk * blockDim_x < grid_size; chunk++) {
+    int base = chunk * blockDim_x;
+
+    // Load this chunk's elements
+    shared[tid] = (base + tid < grid_size) ? block_sums[base + tid] : 0.0f;
+    __syncthreads();
+
+    // Brent-Kung up-sweep
+    #pragma unroll
+    for (int d = 0; d < 8; d++) {
+      int step = 2 << d;
+      int half = step >> 1;
+      if ((tid & (step - 1)) == (step - 1)) {
+        shared[tid] += shared[tid - half];
+      }
+      __syncthreads();
+    }
+
+    // Save chunk total before down-sweep overwrites it
+    float chunk_total = shared[blockDim_x - 1];
+
+    // Brent-Kung down-sweep (produces exclusive scan within this chunk)
+    if (tid == 0) {
+      shared[blockDim_x - 1] = 0.0f;
+    }
+    __syncthreads();
+
+    #pragma unroll
+    for (int d = 7; d >= 0; d--) {
+      int step = 2 << d;
+      int half = step >> 1;
+      if ((tid & (step - 1)) == (step - 1)) {
+        float t = shared[tid - half];
+        shared[tid - half] = shared[tid];
+        shared[tid] += t;
+      }
+      __syncthreads();
+    }
+
+    // Write back: local exclusive scan + carry from previous chunks
+    if (base + tid < grid_size) {
+      block_sums[base + tid] = shared[tid] + carry;
+    }
+    __syncthreads();
+
+    // Update carry for next chunk
+    carry += chunk_total;
   }
 }
 
@@ -174,14 +178,13 @@ torch::Tensor prefix_sum_cuda(torch::Tensor x) {
   auto block_sums = torch::empty({grid_size}, x.options());
 
   // Step 1: Each block does inclusive scan on its chunk
-  // Also writes block sum to block_sums
   scan_blocks_kernel<<<grid_size, block_size, block_size * sizeof(float)>>>(
     x.data_ptr<float>(), out.data_ptr<float>(),
     block_sums.data_ptr<float>(), n);
   C10_CUDA_KERNEL_LAUNCH_CHECK();
 
   if (grid_size > 1) {
-    // Step 2: Single block scans the block_sums array (exclusive)
+    // Step 2: Scan the block_sums array (exclusive) — supports arbitrary grid_size
     scan_block_sums_kernel<<<1, block_size, block_size * sizeof(float)>>>(
       block_sums.data_ptr<float>(), grid_size);
     C10_CUDA_KERNEL_LAUNCH_CHECK();

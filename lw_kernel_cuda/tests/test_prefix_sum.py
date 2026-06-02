@@ -32,3 +32,13 @@ def test_prefix_sum_single():
     x = torch.tensor([42.0], device=device, dtype=torch.float32)
     out = torch.ops.lw_kernel_cuda.prefix_sum(x)
     torch.testing.assert_close(out, x, rtol=1e-5, atol=1e-5)
+
+
+def test_prefix_sum_large():
+    """Test with N > 65536 to exercise multi-block scan path (grid_size > 256)."""
+    device = "cuda"
+    n = 100000
+    x = torch.randn(n, device=device, dtype=torch.float32)
+    expected = torch.cumsum(x, dim=0)
+    out = torch.ops.lw_kernel_cuda.prefix_sum(x)
+    torch.testing.assert_close(out, expected, rtol=1e-4, atol=1e-4)

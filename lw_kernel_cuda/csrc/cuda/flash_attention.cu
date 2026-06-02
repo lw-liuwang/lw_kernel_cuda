@@ -17,19 +17,22 @@
   CHECK_CONTIGUOUS(x)
 
 /**
- * FlashAttention — optimized with larger tiles and blockReduce.
- *
- * Architecture:
- *   - blockDim = 128 threads: each thread handles 1 element of d=128
- *   - One block per (head, query_row): grid = (B*H, seqlen)
- *   - Br=1, Bc=32: processes one query row at a time, K/V in tiles of 32
- *   - blockReduceSum for the dot product Q·K across all 128 threads
- *   - Online softmax update with per-thread state
- *
- * Shared memory: sK(Bc x d) + sV(Bc x d) = 2 * 32 * 128 * 4 = 32 KB
+ * Warp-level reduce sum: reduces across all 32 threads in a warp.
+ * Result is available to ALL threads in the warp (not just lane 0).
+ * ~15 cycles, no shared memory or __syncthreads() needed.
  */
+__device__ float warpReduceSum(float val) {
+  #pragma unroll
+  for (int offset = 16; offset > 0; offset >>= 1)
+    val += __shfl_xor_sync(0xffffffff, val, offset);
+  return val;
+}
+
+// ----------------------------------------------------------------
+// Br=1 fallback kernel (for d=64): one query row per block
+// ----------------------------------------------------------------
 template <int Bc>
-__global__ void flash_attention_kernel(
+__global__ void flash_attention_br1_kernel(
     const float* __restrict__ Q,
     const float* __restrict__ K,
     const float* __restrict__ V,
@@ -43,14 +46,10 @@ __global__ void flash_attention_kernel(
   int head_base = blockIdx.x * stride_head;
   Q += head_base; K += head_base; V += head_base; O += head_base;
 
-  // Each thread handles 1 element in the d dimension
-  // Map tid=0..127 to d=0..127
   if (tid >= d) return;
 
-  // Load Q element
   float q_val = Q[q_row * d + tid];
 
-  // Online softmax state (per-thread)
   float m = -INFINITY;
   float s = 0.0f;
   float acc = 0.0f;
@@ -58,12 +57,9 @@ __global__ void flash_attention_kernel(
   int num_tiles = (seqlen + Bc - 1) / Bc;
 
   for (int tile = 0; tile < num_tiles; tile++) {
-    // Shared memory for K and V tiles
-    __shared__ float sK[Bc * 128];  // Bc x d (d=128 max)
+    __shared__ float sK[Bc * 128];
     __shared__ float sV[Bc * 128];
 
-    // Load K and V tile into shared memory
-    // Each thread loads elements using grid-stride loop
     for (int i = tid; i < Bc * d; i += blockDim.x) {
       int bc_idx = i / d;
       int di = i % d;
@@ -78,39 +74,145 @@ __global__ void flash_attention_kernel(
     }
     __syncthreads();
 
-    // Process each position in this tile
     for (int p = 0; p < Bc; p++) {
       int k_pos = tile * Bc + p;
       if (k_pos >= seqlen) break;
 
-      // Dot product: Q[q_row] · K[k_pos] via blockReduceSum
       float partial = q_val * sK[p * d + tid];
-
-      // blockReduceSum: reduces across all 128 threads
-      // thread 0 gets the total sum
       float total = blockReduceSum(partial);
 
-      // Broadcast total to all threads via shared memory
       __shared__ float s_total;
       if (tid == 0) s_total = total;
       __syncthreads();
       float score = s_total * sm_scale;
 
-      // Online softmax update
       float new_m = fmaxf(m, score);
       float rescale = expf(m - new_m);
       float p_val = expf(score - new_m);
       s = s * rescale + p_val;
       m = new_m;
 
-      // Update output accumulator
       acc = acc * rescale + p_val * sV[p * d + tid];
     }
     __syncthreads();
   }
 
-  // Normalize and write output
   O[q_row * d + tid] = acc / s;
+}
+
+// ----------------------------------------------------------------
+// Br=4 warp-reduce kernel (for d=128): 4 query rows per block
+// ----------------------------------------------------------------
+/**
+ * Architecture:
+ *   - blockDim = 128 (4 warps x 32 threads)
+ *   - Each warp handles 1 query row → Br = 4
+ *   - grid = (B*H, seqlen/Br)
+ *   - Bc = 32: K/V tile of 32 positions
+ *   - Each thread handles d/warpSize = 4 elements via float4
+ *   - Dot product: per-thread float4 dot → warpReduceSum (pure shuffle, no smem)
+ *   - Online softmax per-warp state
+ */
+template <int Bc>
+__global__ void flash_attention_br4_kernel(
+    const float* __restrict__ Q,
+    const float* __restrict__ K,
+    const float* __restrict__ V,
+    float* __restrict__ O,
+    int seqlen, int stride_head, int d, float sm_scale) {
+
+  int tid = threadIdx.x;
+  int warp = tid >> 5;       // warp = 0..3, each handles one query row
+  int lane = tid & 31;       // lane = 0..31, each handles 4 d-elements (d=128)
+
+  int head_base = blockIdx.x * stride_head;
+  int q_base_row = blockIdx.y * 4;
+
+  Q += head_base; K += head_base; V += head_base; O += head_base;
+
+  int q_row = q_base_row + warp;
+
+  // Each thread handles 4 elements in the d dimension (d=128, 128/32=4)
+
+  // Load Q values (float4)
+  float4 q_val;
+  if (q_row < seqlen) {
+    q_val = reinterpret_cast<const float4*>(Q)[q_row * (d / 4) + lane];
+  } else {
+    q_val = make_float4(0.0f, 0.0f, 0.0f, 0.0f);
+  }
+
+  // Online softmax state (per-thread, shared across warp via shuffle broadcast)
+  float m = -INFINITY;
+  float s = 0.0f;
+  float acc_x = 0.0f, acc_y = 0.0f, acc_z = 0.0f, acc_w = 0.0f;
+
+  int num_tiles = (seqlen + Bc - 1) / Bc;
+
+  for (int tile = 0; tile < num_tiles; tile++) {
+    __shared__ float sK[Bc * 128];
+    __shared__ float sV[Bc * 128];
+
+    // All 128 threads cooperate to load K and V tiles into shared memory
+    for (int i = tid; i < Bc * d; i += blockDim.x) {
+      int bc_idx = i / d;
+      int di = i % d;
+      int k_pos = tile * Bc + bc_idx;
+      if (k_pos < seqlen) {
+        sK[bc_idx * d + di] = K[k_pos * d + di];
+        sV[bc_idx * d + di] = V[k_pos * d + di];
+      } else {
+        sK[bc_idx * d + di] = 0.0f;
+        sV[bc_idx * d + di] = 0.0f;
+      }
+    }
+    __syncthreads();
+
+    // Process each KV position in this tile
+    for (int p = 0; p < Bc; p++) {
+      int k_pos = tile * Bc + p;
+      if (k_pos >= seqlen) break;
+
+      // Load K values: float4 at lane offset within this row
+      float4 k_val = reinterpret_cast<float4*>(&sK[p * d])[lane];
+
+      // Dot product: sum of 4 products within this thread
+      float partial = q_val.x * k_val.x + q_val.y * k_val.y
+                    + q_val.z * k_val.z + q_val.w * k_val.w;
+
+      // Warp-level reduce: all 32 threads in warp get the total
+      float total = warpReduceSum(partial);
+      float score = total * sm_scale;
+
+      // Online softmax update (same m/s/score for all threads in warp)
+      float new_m = fmaxf(m, score);
+      float rescale = expf(m - new_m);
+      float p_val = expf(score - new_m);
+      s = s * rescale + p_val;
+      m = new_m;
+
+      // Load V values: float4 at lane offset
+      float4 v_val = reinterpret_cast<float4*>(&sV[p * d])[lane];
+
+      // Update accumulator (4 elements per thread)
+      acc_x = acc_x * rescale + p_val * v_val.x;
+      acc_y = acc_y * rescale + p_val * v_val.y;
+      acc_z = acc_z * rescale + p_val * v_val.z;
+      acc_w = acc_w * rescale + p_val * v_val.w;
+    }
+    __syncthreads();
+  }
+
+  // Write output
+  if (q_row < seqlen) {
+    float inv_s = 1.0f / s;
+    float4 result;
+    result.x = acc_x * inv_s;
+    result.y = acc_y * inv_s;
+    result.z = acc_z * inv_s;
+    result.w = acc_w * inv_s;
+    reinterpret_cast<float4*>(O)[q_row * (d / 4) + lane] = result;
+  }
 }
 
 torch::Tensor flash_attention_cuda(torch::Tensor q, torch::Tensor k, torch::Tensor v) {
@@ -132,18 +234,32 @@ torch::Tensor flash_attention_cuda(torch::Tensor q, torch::Tensor k, torch::Tens
   int stride_head = seqlen * dim;
 
   auto out = torch::zeros_like(q);
-
   const int Bc = 32;
-  int Gc = bs * head;
-  int Gr = seqlen;
 
-  dim3 grid(Gc, Gr);
-  int block_size = dim < 32 ? 32 : dim;  // each thread handles 1 element, min 32 for occupancy
-  dim3 block(block_size);
+  if (dim == 128) {
+    // Br=4 kernel: 4 query rows per block, warp-level reduction, float4 per thread
+    int Gc = bs * head;
+    int Gr = (seqlen + 3) / 4;  // ceil(seqlen / Br)
 
-  flash_attention_kernel<Bc><<<grid, block>>>(
-    q.data_ptr<float>(), k.data_ptr<float>(), v.data_ptr<float>(),
-    out.data_ptr<float>(), seqlen, stride_head, dim, sm_scale);
+    dim3 grid(Gc, Gr);
+    dim3 block(128);  // 4 warps x 32 threads
+
+    flash_attention_br4_kernel<Bc><<<grid, block>>>(
+      q.data_ptr<float>(), k.data_ptr<float>(), v.data_ptr<float>(),
+      out.data_ptr<float>(), seqlen, stride_head, dim, sm_scale);
+  } else {
+    // Fallback: Br=1 kernel (for dim=64 and other dims)
+    int Gc = bs * head;
+    int Gr = seqlen;
+
+    dim3 grid(Gc, Gr);
+    int block_size = dim < 32 ? 32 : dim;
+    dim3 block(block_size);
+
+    flash_attention_br1_kernel<Bc><<<grid, block>>>(
+      q.data_ptr<float>(), k.data_ptr<float>(), v.data_ptr<float>(),
+      out.data_ptr<float>(), seqlen, stride_head, dim, sm_scale);
+  }
 
   C10_CUDA_KERNEL_LAUNCH_CHECK();
   return out;
