@@ -1,5 +1,46 @@
 # Changelog
 
+## 第三轮优化 (2026-06-02)
+
+### 优化概览
+
+对本轮 2 个算子进行了进一步优化，benchmark 测试通过，完整测试套件 46 项全部通过。
+
+---
+
+### P0: Flash Attention d=64 Br=4 + Warp-Level Reduction
+
+**文件**: `lw_kernel_cuda/csrc/cuda/flash_attention.cu`
+
+- **新增 `flash_attention_br4_kernel_d64`**：面向 d=64 的 Br=4 优化 kernel
+  - blockDim=128（4 个 warp），每个 warp 独立处理一个 query row
+  - 每线程 float2（2 个 d 元素），向量化加载 Q/K/V
+  - **warpReduceSum**（纯 shuffle，无 smem/sync）替代 blockReduceSum
+  - grid 从 `(B*H, seqlen)` 缩小到 `(B*H, seqlen/4)`，全局 K/V 读取减少 4 倍
+- **dispatch 更新**: dim=64 路径从 Br=1 fallback 改为使用 `flash_attention_br4_kernel_d64`
+
+**性能**: d=64 (B1H1S4096) 从 0.10 → 0.67 TFLOPS（~6.7x），峰值利用率从 0.3% → 2.1%
+
+---
+
+### P0: Prefix Sum 每线程 2 元素 + 正确 Exclusive Scan
+
+**文件**: `lw_kernel_cuda/csrc/cuda/prefix_sum.cu`
+
+- **新增 `scan_blocks_kernel` 每线程 2 元素版本**：
+  - 每个 block 处理 `2 * blockDim.x` 元素，grid size 减半
+  - 使用 up-sweep + inclusive post-scan（Blelloch 算法）
+- **修复 `scan_block_sums_kernel`**：
+  - 改用正确的 **Blelloch exclusive down-sweep**（set-last-to-zero + copy-and-add）
+  - 原实现使用了 inclusive post-scan（与 `scan_blocks_kernel` 相同），误用于需要 exclusive 结果的 block_sums 扫描
+  - 新实现: `stride` 从 `chunk_size>>1` 开始，`right < chunk_size` 条件，`t=shared[left]; shared[left]=shared[right]; shared[right]+=t;`
+  - 配合 grid-stride loop 的 carry 累加，正确计算出全局 exclusive prefix
+- **更新 `add_block_sums_kernel`**：适配每线程 2 元素的 block 布局
+
+**性能**: N=100M 从 107 → **171 GB/s**（~1.6x），正确性通过所有测试（含 N=100000 多 block 路径）
+
+---
+
 ## 第二轮优化 (2026-06-02)
 
 ### 优化概览

@@ -215,6 +215,116 @@ __global__ void flash_attention_br4_kernel(
   }
 }
 
+// ----------------------------------------------------------------
+// Br=4 warp-reduce kernel (for d=64): 4 query rows per block
+// ----------------------------------------------------------------
+/**
+ * Architecture: same as d=128 Br=4 but with float2 per thread (d=64, 64/32=2)
+ *   - blockDim = 128 (4 warps x 32 threads)
+ *   - Each warp handles 1 query row → Br = 4
+ *   - grid = (B*H, seqlen/Br)
+ *   - Bc = 32: K/V tile of 32 positions
+ *   - Each thread handles d/warpSize = 2 elements via float2
+ *   - Dot product: per-thread float2 dot → warpReduceSum (pure shuffle, no smem)
+ *   - Online softmax per-warp state
+ */
+template <int Bc>
+__global__ void flash_attention_br4_kernel_d64(
+    const float* __restrict__ Q,
+    const float* __restrict__ K,
+    const float* __restrict__ V,
+    float* __restrict__ O,
+    int seqlen, int stride_head, int d, float sm_scale) {
+
+  int tid = threadIdx.x;
+  int warp = tid >> 5;       // warp = 0..3, each handles one query row
+  int lane = tid & 31;       // lane = 0..31, each handles 2 d-elements (d=64)
+
+  int head_base = blockIdx.x * stride_head;
+  int q_base_row = blockIdx.y * 4;
+
+  Q += head_base; K += head_base; V += head_base; O += head_base;
+
+  int q_row = q_base_row + warp;
+
+  // Each thread handles 2 elements in the d dimension (d=64, 64/32=2)
+
+  // Load Q values (float2)
+  float2 q_val;
+  if (q_row < seqlen) {
+    q_val = reinterpret_cast<const float2*>(Q)[q_row * (d / 2) + lane];
+  } else {
+    q_val = make_float2(0.0f, 0.0f);
+  }
+
+  // Online softmax state (per-thread, shared across warp via shuffle broadcast)
+  float m = -INFINITY;
+  float s = 0.0f;
+  float acc_x = 0.0f, acc_y = 0.0f;
+
+  int num_tiles = (seqlen + Bc - 1) / Bc;
+
+  for (int tile = 0; tile < num_tiles; tile++) {
+    __shared__ float sK[Bc * 128];
+    __shared__ float sV[Bc * 128];
+
+    // All 128 threads cooperate to load K and V tiles into shared memory
+    for (int i = tid; i < Bc * d; i += blockDim.x) {
+      int bc_idx = i / d;
+      int di = i % d;
+      int k_pos = tile * Bc + bc_idx;
+      if (k_pos < seqlen) {
+        sK[bc_idx * d + di] = K[k_pos * d + di];
+        sV[bc_idx * d + di] = V[k_pos * d + di];
+      } else {
+        sK[bc_idx * d + di] = 0.0f;
+        sV[bc_idx * d + di] = 0.0f;
+      }
+    }
+    __syncthreads();
+
+    // Process each KV position in this tile
+    for (int p = 0; p < Bc; p++) {
+      int k_pos = tile * Bc + p;
+      if (k_pos >= seqlen) break;
+
+      // Load K values: float2 at lane offset within this row
+      float2 k_val = reinterpret_cast<float2*>(&sK[p * d])[lane];
+
+      // Dot product: sum of 2 products within this thread
+      float partial = q_val.x * k_val.x + q_val.y * k_val.y;
+
+      // Warp-level reduce: all 32 threads in warp get the total
+      float total = warpReduceSum(partial);
+      float score = total * sm_scale;
+
+      // Online softmax update (same m/s/score for all threads in warp)
+      float new_m = fmaxf(m, score);
+      float rescale = expf(m - new_m);
+      float p_val = expf(score - new_m);
+      s = s * rescale + p_val;
+      m = new_m;
+
+      // Load V values: float2 at lane offset
+      float2 v_val = reinterpret_cast<float2*>(&sV[p * d])[lane];
+
+      // Update accumulator (2 elements per thread)
+      acc_x = acc_x * rescale + p_val * v_val.x;
+      acc_y = acc_y * rescale + p_val * v_val.y;
+    }
+    __syncthreads();
+  }
+
+  // Write output
+  if (q_row < seqlen) {
+    float inv_s = 1.0f / s;
+    float2 result;
+    result.x = acc_x * inv_s;
+    result.y = acc_y * inv_s;
+    reinterpret_cast<float2*>(O)[q_row * (d / 2) + lane] = result;
+  }
+}
+
 torch::Tensor flash_attention_cuda(torch::Tensor q, torch::Tensor k, torch::Tensor v) {
   CHECK_INPUT(q); CHECK_INPUT(k); CHECK_INPUT(v);
   TORCH_CHECK(q.dtype() == at::kFloat);
@@ -247,8 +357,19 @@ torch::Tensor flash_attention_cuda(torch::Tensor q, torch::Tensor k, torch::Tens
     flash_attention_br4_kernel<Bc><<<grid, block>>>(
       q.data_ptr<float>(), k.data_ptr<float>(), v.data_ptr<float>(),
       out.data_ptr<float>(), seqlen, stride_head, dim, sm_scale);
+  } else if (dim == 64) {
+    // Br=4 kernel for d=64: float2 per thread, warp-level reduction
+    int Gc = bs * head;
+    int Gr = (seqlen + 3) / 4;  // ceil(seqlen / Br)
+
+    dim3 grid(Gc, Gr);
+    dim3 block(128);  // 4 warps x 32 threads
+
+    flash_attention_br4_kernel_d64<Bc><<<grid, block>>>(
+      q.data_ptr<float>(), k.data_ptr<float>(), v.data_ptr<float>(),
+      out.data_ptr<float>(), seqlen, stride_head, dim, sm_scale);
   } else {
-    // Fallback: Br=1 kernel (for dim=64 and other dims)
+    // Fallback: Br=1 kernel (for other dims)
     int Gc = bs * head;
     int Gr = seqlen;
 

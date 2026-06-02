@@ -1,13 +1,13 @@
 <!--
-  lw-kernel-cuda: 从零搭建的 CUDA 算子库
+  lw-kernel-cuda: 高性能 CUDA 算子库
 
-  一个专注于深度学习推理场景、从零手写的 CUDA 算子集合。
-  覆盖 10 个核心算子，从简单到复杂逐步优化，每个算子在 doc/ 下有对应的原理讲解文档。
+  基于 PyTorch Custom CUDA Extension 的高性能算子库，
+  覆盖 10 个深度学习推理核心算子，采用 warp tiling、双缓冲流水线、warp 级归约等先进优化技术。
 -->
 
 <p align="center">
   <h1 align="center">lw-kernel-cuda</h1>
-  <p align="center">从零搭建的深度学习 CUDA 算子库</p>
+  <p align="center">高性能 CUDA 算子库</p>
   <p align="center">
     <a href="./BENCHMARKS.md">性能指标</a>
     ·
@@ -17,26 +17,50 @@
 
 ## 简介
 
-**lw-kernel-cuda** 是一个从零手写的 CUDA 算子库，基于 PyTorch Custom CUDA Extension 实现。
+**lw-kernel-cuda** 是一个基于 PyTorch Custom CUDA Extension 的高性能算子库，覆盖深度学习推理中 10 个核心算子。
 
-覆盖深度学习推理中的 10 个核心算子，涵盖 **访存密集型**（VecAdd、Reduce、PrefixSum 等）和 **计算密集型**（MatMul、Conv2D、FlashAttention 等）两类场景。
+涵盖 **访存密集型**（VecAdd、Reduce、PrefixSum 等）和 **计算密集型**（MatMul、Conv2D、FlashAttention 等）两类场景，采用 warp tiling、双缓冲流水线、warp 级归约等 CUDA 优化技术，部分算子性能显著优于 PyTorch 参考实现。
 
-目标：在动手实现每个算子的过程中，系统性地掌握 CUDA 优化方法论。
+### 性能亮点
+
+| 算子 | 最佳性能 | vs PyTorch | 峰值利用率 |
+|------|---------|-----------|-----------|
+| reduce | **500 GB/s** | 持平 | 84% |
+| vec_add | **473 GB/s** | 持平 | 79% |
+| transpose | **411 GB/s** | **1.55x** | 69% |
+| rmsnorm | **316 GB/s** | **2.75x** | 53% |
+| histogram | **122 GB/s** | **74x** | 20% |
+| matmul | **9.78 TFLOPS** | 80% | 31% |
+
+> 完整性能数据参见 [BENCHMARKS.md](./BENCHMARKS.md)。测试环境：NVIDIA A10（峰值 600 GB/s, 31.2 TFLOPS FP32）。
 
 ## 算子列表
 
-| # | 算子 | 核心知识点 | 难度 |
-|---|------|-----------|------|
-| 1 | **[VecAdd](doc/vec_add.md)** | grid-stride loop, 线程模型, 合并访存 | ⭐ |
-| 2 | **[Reduce](doc/reduce.md)** | shared memory, warp shuffle, block reduce 模式 | ⭐⭐ |
-| 3 | **[Softmax](doc/softmax.md)** | 多阶段 reduce (max + sum), online softmax | ⭐⭐ |
-| 4 | **[RMSNorm](doc/rmsnorm.md)** | blockReduceSum, float4 向量化, rsqrtf | ⭐⭐ |
-| 5 | **[Transpose](doc/transpose.md)** | shared memory tiling, bank conflict 与 padding, 合并/非合并访存 | ⭐⭐⭐ |
-| 6 | **[Histogram](doc/histogram.md)** | atomicAdd, 共享内存直方图合并, 原子操作性能 | ⭐⭐⭐ |
-| 7 | **[PrefixSum](doc/prefix_sum.md)** | Kogge-Stone / Brent-Kung 算法, 多 block 扫描 | ⭐⭐⭐ |
-| 8 | **[MatMul](doc/matmul.md)** | 共享内存 tiling, warp tiling, 寄存器 tiling, 双缓冲 | ⭐⭐⭐⭐ |
-| 9 | **[Conv2D](doc/conv2d.md)** | im2col + GEMM, 卷积加速, 权重转置 | ⭐⭐⭐⭐ |
-| 10 | **[FlashAttention](doc/flash_attention.md)** | tiled online softmax, kernel fusion, O(N²)→O(N) 显存 | ⭐⭐⭐⭐⭐ |
+| 类别 | # | 算子 | 核心技术 | 优化亮点 |
+|------|---|------|---------|---------|
+| 访存密集型 | 1 | **VecAdd** | grid-stride loop, 合并访存 | 79% 带宽利用率 |
+| | 2 | **Reduce** | shared memory, warp shuffle | 84% 带宽利用率 |
+| | 3 | **Softmax** | online softmax, float4 向量化 | 融合 exp + sum 消除全局往返 |
+| | 4 | **RMSNorm** | blockReduceSum, float4, rsqrtf | **2.75x vs PyTorch** |
+| | 5 | **Transpose** | shared memory tiling, bank conflict 消除 | **1.55x vs PyTorch**, 含 padding 优化 |
+| | 6 | **Histogram** | atomicAdd, 共享内存合并 | **74x vs PyTorch** (避免 GPU→CPU 传输) |
+| | 7 | **PrefixSum** | Brent-Kung 算法, 多 block 扫描 | 修复多 block 正确性，支持任意规模 |
+| 计算密集型 | 8 | **MatMul** | warp tiling, 寄存器 tiling, 双缓冲 + cp.async | 9.78 TFLOPS (31% 峰值) |
+| | 9 | **Conv2D** | im2col + GEMM, 权重转置 | 随 MatMul 自动受益 |
+| | 10 | **FlashAttention** | Br=4 tile, warp 级归约, float4 | **0.83 TFLOPS (7x vs 旧版)**, d=128 优化 |
+
+## 优化技术体系
+
+| 技术 | 说明 | 应用算子 |
+|------|------|---------|
+| **Warp tiling + 寄存器 tiling** | 分层 tile 分解，最大化寄存器复用 | MatMul, Conv2D |
+| **双缓冲 + cp.async** | ping-pong 共享内存，隐藏全局加载延迟 | MatMul (db 变体) |
+| **Warp 级归约** | 纯 shuffle 归约，消除 smem 与 sync 开销 | Reduce, Softmax, **FlashAttention** |
+| **float4 向量化访存** | 128-bit 合并访存，提升带宽利用率 | VecAdd, Reduce, Softmax, RMSNorm, MatMul, FlashAttention |
+| **Online softmax** | 单次前向 fused max + sum + output | Softmax, FlashAttention |
+| **Grid-stride loop** | 自适应任意规模，简化边界处理 | VecAdd, Histogram, PrefixSum |
+| **Bank conflict 消除** | 共享内存 padding 策略 | Transpose, MatMul |
+| **Brent-Kung 扫描** | 高效 work-efficient 前缀和 | PrefixSum |
 
 ## 快速开始
 
@@ -44,7 +68,6 @@
 
 - CUDA Toolkit ≥ 12.0（推荐 12.4+）
 - PyTorch ≥ 2.0
-- Python ≥ 3.10
 - GPU: 计算能力 8.0+（Ampere 架构及以上，用于 cp.async 等特性）
 
 ### 构建
@@ -59,8 +82,6 @@ python3 setup.py build_ext --inplace
 ```bash
 python3 -m pytest lw_kernel_cuda/tests/ -v
 ```
-
-所有测试通过后，即可开始使用。
 
 ### 使用示例
 
@@ -96,54 +117,33 @@ lw-kernel-cuda/
 ├── setup.py                        # PyTorch extension 构建脚本
 ├── include/                        # 共享工具头文件
 │   ├── block_reduce.h              # blockReduceSum / blockReduceMax
-│   ├── matmul_kernel.cuh           # MatMul 模板（含同步/双缓冲双版本）
+│   ├── matmul_kernel.cuh           # MatMul 模板（同步/双缓冲双版本）
 │   └── cuda_helpers.h              # CUDA_CHECK 等辅助宏
-├── doc/                            # 10 个算子的原理与优化文档
-│   ├── vec_add.md
-│   ├── flash_attention.md
-│   └── ...
-├── benchmarks/                     # 性能测试（统一框架）
+├── doc/                            # 算子技术文档
+├── benchmarks/                     # 性能测试框架
 │   ├── run_all.py                  # 一键运行所有 benchmark
-│   ├── bench_utils.py              # 基准测试工具函数
-│   └── bench_*.py                  # 每个算子的独立 benchmark
+│   ├── bench_utils.py              # 基准测试工具
+│   └── bench_*.py                  # 各算子独立 benchmark
 ├── lw_kernel_cuda/
 │   ├── __init__.py                 # 导入 _C + 导出所有算子
-│   ├── _C.cpython-*.so             # 编译后的扩展（运行时生成）
 │   ├── csrc/                       # C++/CUDA 源码
 │   │   ├── extension.cpp           # TORCH_LIBRARY schema 注册
 │   │   └── cuda/                   # 10 个算子的 .cu 实现
 │   ├── ops/                        # Python 封装层
-│   └── tests/                      # 正确性测试（pytest）
+│   └── tests/                      # pytest 正确性测试
 ├── CHANGELOG.md                    # 版本更新记录
 ├── BENCHMARKS.md                   # 性能指标与分析
 └── README.md                       # 本文件
 ```
 
-## 优化技术一览
+## 质量保障
 
-| 技术 | 涉及的算子 |
-|------|-----------|
-| Grid-stride loop | VecAdd, Histogram, PrefixSum |
-| Shared memory tiling | Reduce, Softmax, Transpose, MatMul, Conv2D, FlashAttention |
-| Warp shuffle 归约 | Reduce, Softmax, **FlashAttention (Br=4 kernel)** |
-| float4 向量化访存 | VecAdd, Reduce, Softmax, RMSNorm, MatMul, **FlashAttention** |
-| 融合 kernel | Softmax (exp+sum), FlashAttention (online softmax + output) |
-| Bank conflict 消除 | Transpose (padding), MatMul (+1 stride) |
-| 原子操作 | Histogram |
-| 寄存器 tiling | MatMul, Conv2D |
-| **双缓冲 + cp.async** | **MatMul (db 变体)** |
-| **Warp 级 reduction** | **FlashAttention (替代 blockReduce 消除 sync)** |
-| Brent-Kung 算法 | PrefixSum |
-
-## 设计原则
-
-1. **从 naive 到优化**：每个算子提供多个优化版本的演进路径，对应课程文档的讲解节奏
-2. **可读性优先**：kernel 代码注释完整，关键优化点有对应文档解释
-3. **与 PyTorch 对照**：每个算子的测试和 benchmark 均以 PyTorch 参考实现为 baseline
-4. **正确性保障**：基于 pytest 的测试体系，覆盖边界条件（空张量、单元素、非对齐等）
+- **pytest 测试套件**：46 项测试覆盖 10 个算子，含边界条件（空张量、单元素、非对齐等）
+- **PyTorch 对照验证**：每个算子的输出与 PyTorch 参考实现进行数值对校
+- **统一 Benchmark 框架**：10 次 warmup + 100 次测量取平均，自动计算带宽 / TFLOPS
 
 ## 相关资源
 
 - [cuBLAS](https://docs.nvidia.com/cuda/cublas/) / [CUTLASS](https://github.com/NVIDIA/cutlass) — NVIDIA 官方高性能线性代数库
-- [FlashAttention 论文](https://arxiv.org/abs/2205.14135) — 本文 kernel fusion 思路的来源
+- [FlashAttention 论文](https://arxiv.org/abs/2205.14135) — tiled online softmax 注意力机制
 - [PyTorch Custom C++ & CUDA Extensions](https://pytorch.org/tutorials/advanced/cpp_extension.html)
