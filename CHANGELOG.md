@@ -8,18 +8,20 @@
 
 ---
 
-### P0: Flash Attention d=64 Br=4 + Warp-Level Reduction
+### P0: Flash Attention Br=4 → Br=8 全面升级
 
 **文件**: `lw_kernel_cuda/csrc/cuda/flash_attention.cu`
 
-- **新增 `flash_attention_br4_kernel_d64`**：面向 d=64 的 Br=4 优化 kernel
-  - blockDim=128（4 个 warp），每个 warp 独立处理一个 query row
-  - 每线程 float2（2 个 d 元素），向量化加载 Q/K/V
-  - **warpReduceSum**（纯 shuffle，无 smem/sync）替代 blockReduceSum
-  - grid 从 `(B*H, seqlen)` 缩小到 `(B*H, seqlen/4)`，全局 K/V 读取减少 4 倍
-- **dispatch 更新**: dim=64 路径从 Br=1 fallback 改为使用 `flash_attention_br4_kernel_d64`
+- **新增 `flash_attention_br8_kernel`**（d=128, float4）和 **`flash_attention_br8_kernel_d64`**（d=64, float2）：
+  - 每个 warp 处理 2 个 query row（Br=4 时每个 warp 处理 1 个）
+  - grid 从 `(B*H, S/4)` 缩小到 `(B*H, S/8)`，K/V 全局读取进一步减半
+  - 每线程维护 2 套 online softmax 状态和 2 套 accumulator
+  - 每 K 位置计算 2 次 dot product + 2 次 warpReduceSum（纯 shuffle）
+- **替换 Br=4 kernel** 成为 d=128/d=64 的主 kernel
+- Bc=64 尝试：64KB 共享内存改变了 L1/shared 分区，d=128 上性能倒退，未采用
+- Br=4 kernel 保留作为代码参考
 
-**性能**: d=64 (B1H1S4096) 从 0.10 → 0.67 TFLOPS（~6.7x），峰值利用率从 0.3% → 2.1%
+**性能**: d=128 B1H1S4096 从 0.83 → **1.16 TFLOPS**（1.40x），d=64 从 0.67 → **0.93 TFLOPS**（1.39x）
 
 ---
 
